@@ -24,8 +24,6 @@ SQLite stores tasks, evidence links, and decisions under `data/`. Override the d
 python -m pytest -q
 ```
 
-Inspired by [Brian Armstrong's agent workflow](https://x.com/brian_armstrong/status/2119112609223827547).
-
 ## Background worker and Draft PRs
 
 Set `CHIEF_BACKGROUND_JOBS=1` in both the web app and worker environments, then
