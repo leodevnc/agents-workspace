@@ -14,6 +14,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field, HttpUrl
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from . import jobs
+
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("CHIEF_DB_PATH", str(ROOT.parent / "data" / "chief.sqlite3")))
 ROLES = {"engineering": "Engineering Lead", "research": "Research Lead", "operations": "Operations Lead"}
@@ -66,6 +68,7 @@ def init_db():
             task_id INTEGER NOT NULL, action TEXT NOT NULL, note TEXT NOT NULL,
             created_at TEXT NOT NULL, FOREIGN KEY(task_id) REFERENCES tasks(id)
         )""")
+        jobs.init(c)
 
 
 init_db()
@@ -104,7 +107,7 @@ def get_task(task_id: int) -> dict:
     return serialize_task(row)
 
 
-def model_text(system: str, user: str) -> str:
+def model_text(system: str, user: str, *, max_output_tokens: int = 900) -> str:
     """Explicit demo fallback; no simulated result is presented as real LLM output."""
     key = os.getenv("OPENAI_API_KEY")
     if not key:
@@ -117,7 +120,8 @@ def model_text(system: str, user: str) -> str:
         model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
         instructions=system,
         input=user,
-        max_output_tokens=900,
+        max_output_tokens=max_output_tokens,
+        store=False,
     )
     return result.output_text
 
@@ -135,16 +139,35 @@ def home():
     return FileResponse(ROOT / "static" / "index.html")
 
 
+def worker_enabled():
+    return os.getenv("CHIEF_BACKGROUND_JOBS") == "1"
+
+
+def code_enabled():
+    return worker_enabled() and bool(os.getenv("CHIEF_GITHUB_REPO"))
+
+
 @app.get("/api/health")
 def health():
-    return {"ok": True, "mode": "llm" if os.getenv("OPENAI_API_KEY") else "demo"}
+    return {
+        "ok": True,
+        "mode": "llm" if os.getenv("OPENAI_API_KEY") else "demo",
+        "background_jobs": worker_enabled(),
+        "code_jobs": code_enabled(),
+        "code_repo": os.getenv("CHIEF_GITHUB_REPO") if code_enabled() else None,
+    }
 
 
 @app.get("/api/tasks")
 def tasks():
     with db() as c:
-        rows = c.execute("SELECT * FROM tasks ORDER BY CASE status WHEN 'pending_review' THEN 0 ELSE 1 END, priority ASC, id DESC").fetchall()
-    return [serialize_task(row) for row in rows]
+        rows = c.execute("""SELECT * FROM tasks ORDER BY
+            CASE status WHEN 'pending_review' THEN 0 ELSE 1 END, priority, id DESC""").fetchall()
+        latest = c.execute("""SELECT j.* FROM jobs j JOIN
+            (SELECT max(rowid) AS last FROM jobs GROUP BY task_id) latest
+            ON j.rowid=latest.last""").fetchall()
+    by_task = {job["task_id"]: dict(job) for job in latest}
+    return [dict(serialize_task(row), job=by_task.get(row["id"])) for row in rows]
 
 
 @app.get("/api/decisions")
@@ -162,11 +185,42 @@ def create_task(body: TaskIn):
             VALUES (?,?,?,?,'new',?,?,?)""", (body.title, body.description, body.domain, body.priority,
             timestamp, timestamp, json.dumps([item.model_dump(mode="json") for item in body.evidence])))
         tid = cursor.lastrowid
+        if worker_enabled():
+            jobs.enqueue(c, {"id": tid, "updated_at": timestamp}, "proposal")
     return get_task(tid)
 
 
+@app.post("/api/tasks/{task_id}/jobs/{kind}", status_code=202)
+def queue_job(task_id: int, kind: Literal["proposal", "code"]):
+    if not worker_enabled() or (kind == "code" and not code_enabled()):
+        raise HTTPException(409, "This job type is disabled.")
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        task = c.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if task is None:
+            raise HTTPException(404, "Task not found")
+        if kind == "proposal" and task["status"] not in ("new", "rejected"):
+            raise HTTPException(409, "Only new or rejected tasks can run.")
+        if kind == "code" and (task["status"] != "approved" or task["domain"] != "engineering"):
+            raise HTTPException(409, "Code jobs require an approved engineering task.")
+        prior = c.execute("""SELECT * FROM jobs WHERE task_id=? AND kind=? AND task_version=?
+            ORDER BY rowid DESC LIMIT 1""", (task_id, kind, task["updated_at"])).fetchone()
+        if prior:
+            if prior["state"] == "failed":
+                c.execute("UPDATE jobs SET state='queued', error=NULL WHERE id=?", (prior["id"],))
+            return {"id": prior["id"]}
+        target_repo = os.getenv("CHIEF_GITHUB_REPO") if kind == "code" else None
+        return {"id": jobs.enqueue(c, task, kind, target_repo)}
+
+
 @app.post("/api/tasks/{task_id}/run")
-def run_task(task_id: int):
+def run_task_now(task_id: int):
+    if worker_enabled():
+        raise HTTPException(409, "Queue a proposal when background jobs are enabled.")
+    return run_task(task_id)
+
+
+def run_task(task_id: int, *, queued_job_id: str | None = None):
     task = get_task(task_id)
     if task["status"] not in ("new", "rejected"):
         raise HTTPException(409, "Only new or rejected tasks can run")
@@ -190,8 +244,10 @@ def run_task(task_id: int):
     )
     with db() as c:
         result = c.execute("""UPDATE tasks SET specialist_output=?, proposal=?, chief_summary=?,
-            status='pending_review', updated_at=? WHERE id=? AND status=? AND updated_at=?""",
-            (specialist, lead, chief, now(), task_id, task["status"], task["updated_at"]))
+            status='pending_review', updated_at=? WHERE id=? AND status=? AND updated_at=?
+            AND NOT EXISTS (SELECT 1 FROM jobs WHERE task_id=tasks.id
+                AND state IN ('queued','running') AND id != coalesce(?, ''))""",
+            (specialist, lead, chief, now(), task_id, task["status"], task["updated_at"], queued_job_id))
         if result.rowcount != 1:
             raise HTTPException(409, "Task state changed during processing")
     return get_task(task_id)

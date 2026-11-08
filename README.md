@@ -18,10 +18,38 @@ Requires Python 3.11+. Open http://127.0.0.1:8000.
 
 The default demo runs locally with deterministic output. Set `OPENAI_API_KEY` in your environment to enable OpenAI Responses API calls and optionally set `OPENAI_MODEL` to override the default. Task text and recent decision notes are sent to the model when enabled. Evidence URLs stay in the inbox.
 
-SQLite stores tasks, evidence links, and decisions under `data/`. Override the database path with `CHIEF_DB_PATH`. Use the localhost binding for this single-user app. Approvals record decisions. Agent runs are user-triggered, and evidence is provided by URL. Always-on workers, repository actions, automatic media capture, and voice review are future work.
+SQLite stores tasks, evidence links, and decisions under `data/`. Override the database path with `CHIEF_DB_PATH`. Use the localhost binding for this single-user app. Approvals record decisions. The default mode runs proposals on demand. Background jobs and PR evidence can be enabled as described below.
 
 ```bash
 python -m pytest -q
 ```
 
 Inspired by [Brian Armstrong's agent workflow](https://x.com/brian_armstrong/status/2119112609223827547).
+
+## Background worker and Draft PRs
+
+Set `CHIEF_BACKGROUND_JOBS=1` in both the web app and worker environments, then
+run `python -m app.worker` as a separate process. Both processes must use the
+same SQLite path. The worker requires Linux or macOS, processes jobs in priority
+order, and resumes interrupted jobs on restart. Rejected proposals and failed
+jobs can be retried from the inbox.
+
+To enable code jobs, set `CHIEF_GITHUB_REPO=owner/repo` in both processes, and
+configure the worker with `OPENAI_API_KEY`, `CHIEF_CODE_FILES` (a JSON array of
+up to eight existing source files), Git, and authenticated `gh` with repository
+write and PR access. For example, `CHIEF_CODE_FILES='["app/static/index.html"]'`.
+Only configure source files you are permitted to send to the model. Repository
+files and approved proposals are included in code requests. Keep credentials
+in your local environment or secret manager.
+
+1. Create an engineering task. The worker generates a proposal automatically.
+2. Approve the proposal, then select **Generate changes and open Draft PR**.
+3. Open the Draft PR from the inbox. Inspect the diff and CI results before
+   marking ready. This repository's **Review evidence** workflow exercises the
+   browser flow and uploads a screenshot and video as Actions artifacts.
+
+The worker restricts edits to the configured regular files. It uses Git objects
+without checking out or executing generated code locally. For a different target
+repository, install an appropriate test and capture workflow first. The
+included workflow records a fixed review flow on this app. Use GitHub branch
+protection to enforce CI and human review before merging.
