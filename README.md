@@ -32,7 +32,7 @@ Set `CHIEF_BACKGROUND_JOBS=1` in both the web app and worker environments, then
 run `python -m app.worker` as a separate process. Both processes must use the
 same SQLite path. The worker requires Linux or macOS, processes jobs in priority
 order, and resumes interrupted jobs on restart. Rejected proposals and failed
-jobs can be retried from the inbox.
+jobs can be retried from the inbox. Operators should run `gh auth status` before starting the worker to verify authentication.
 
 To enable code jobs, set `CHIEF_GITHUB_REPO=owner/repo` in both processes, and
 configure the worker with `OPENAI_API_KEY`, `CHIEF_CODE_FILES` (a JSON array of
