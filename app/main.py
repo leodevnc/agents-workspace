@@ -87,6 +87,11 @@ class TaskIn(BaseModel):
     evidence: list[EvidenceIn] = Field(default_factory=list, max_length=12)
 
 
+class RevisionIn(BaseModel):
+    head: str = Field(pattern=r"^[0-9a-f]{40}$")
+    note: str = Field(min_length=3, max_length=3000)
+
+
 class DecisionIn(BaseModel):
     action: Literal["approve", "reject"]
     note: str = Field(default="", max_length=2000)
@@ -166,8 +171,13 @@ def tasks():
         latest = c.execute("""SELECT j.* FROM jobs j JOIN
             (SELECT max(rowid) AS last FROM jobs GROUP BY task_id) latest
             ON j.rowid=latest.last""").fetchall()
+        prs = c.execute("SELECT * FROM pr_status").fetchall()
     by_task = {job["task_id"]: dict(job) for job in latest}
-    return [dict(serialize_task(row), job=by_task.get(row["id"])) for row in rows]
+    reviews = {pr["task_id"]: {
+        "url": pr["url"], "error": pr["error"], "snapshot": json.loads(pr["snapshot"] or "null"),
+    } for pr in prs}
+    return [dict(serialize_task(row), job=by_task.get(row["id"]), pr=reviews.get(row["id"]))
+            for row in rows]
 
 
 @app.get("/api/decisions")
@@ -203,7 +213,7 @@ def queue_job(task_id: int, kind: Literal["proposal", "code"]):
             raise HTTPException(409, "Only new or rejected tasks can run.")
         if kind == "code" and (task["status"] != "approved" or task["domain"] != "engineering"):
             raise HTTPException(409, "Code jobs require an approved engineering task.")
-        prior = c.execute("""SELECT * FROM jobs WHERE task_id=? AND kind=? AND task_version=?
+        prior = c.execute("""SELECT * FROM jobs WHERE task_id=? AND kind=? AND task_version=? AND revision IS NULL
             ORDER BY rowid DESC LIMIT 1""", (task_id, kind, task["updated_at"])).fetchone()
         if prior:
             if prior["state"] == "failed":
@@ -211,6 +221,33 @@ def queue_job(task_id: int, kind: Literal["proposal", "code"]):
             return {"id": prior["id"]}
         target_repo = os.getenv("CHIEF_GITHUB_REPO") if kind == "code" else None
         return {"id": jobs.enqueue(c, task, kind, target_repo)}
+
+
+@app.post("/api/tasks/{task_id}/revision", status_code=202)
+def queue_revision(task_id: int, body: RevisionIn):
+    if not code_enabled():
+        raise HTTPException(409, "Code jobs are disabled.")
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        task = c.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        pr = c.execute("SELECT * FROM pr_status WHERE task_id=?", (task_id,)).fetchone()
+        if not task or not pr:
+            raise HTTPException(404, "Task pull request not found.")
+        snapshot = json.loads(pr["snapshot"] or "{}")
+        if (task["status"] != "approved" or pr["repo"] != os.getenv("CHIEF_GITHUB_REPO")
+                or pr["error"] or snapshot.get("state") != "OPEN"
+                or snapshot.get("fork") or snapshot.get("head") != body.head):
+            raise HTTPException(409, "Refresh the pull request before requesting a revision.")
+        latest = c.execute("SELECT * FROM jobs WHERE task_id=? ORDER BY rowid DESC LIMIT 1",
+                           (task_id,)).fetchone()
+        if latest and latest["state"] in ("queued", "running"):
+            raise HTTPException(409, "This task already has an active job.")
+        payload = json.dumps({"url": pr["url"], **body.model_dump()})
+        if latest and latest["revision"] == payload:
+            if latest["state"] == "failed":
+                c.execute("UPDATE jobs SET state='queued', error=NULL WHERE id=?", (latest["id"],))
+            return {"id": latest["id"]}
+        return {"id": jobs.enqueue(c, task, "code", pr["repo"], payload)}
 
 
 @app.post("/api/tasks/{task_id}/run")

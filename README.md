@@ -53,3 +53,14 @@ without checking out or executing generated code locally. For a different target
 repository, install an appropriate test and capture workflow first. The
 included workflow records a fixed review flow on this app. Use GitHub branch
 protection to enforce CI and human review before merging.
+
+### Review GitHub results in the inbox
+
+The worker refreshes each PR about once per minute and stores the latest CI
+checks, requested reviewers, recent submitted reviews, and available
+`review-evidence` artifacts in SQLite. Its GitHub identity needs read access to
+Actions artifacts. Open a task's pull request panel to inspect the results.
+For a revision, enter the instructions and select **Generate revision in this
+PR**. The worker writes to the original workspace branch only if it still
+matches the reviewed commit. A revision is a separate request and reruns CI
+on the same PR. Review the updated diff on GitHub before merging.
