@@ -132,3 +132,80 @@ def test_code_edits_cannot_escape_configured_files():
         parse_edits('{"app/main.py":"new",".github/workflows/ci.yml":"modified"}', sources)
     with pytest.raises(CodeJobError):
         parse_edits('{"app/main.py":"old"}', sources)
+
+
+def test_pr_sync_and_revision_use_the_reviewed_commit(monkeypatch):
+    from app import worker
+
+    monkeypatch.setenv('CHIEF_BACKGROUND_JOBS', '1')
+    monkeypatch.setenv('CHIEF_GITHUB_REPO', 'example/workspace')
+    task = client.post('/api/tasks', json={
+        'title': 'Revise a pull request', 'description': 'Apply review feedback',
+    }).json()
+    task_id = task['id']
+    url = 'https://github.com/example/workspace/pull/12'
+    head = 'a' * 40
+    assert worker.process_one()
+    assert client.post(f'/api/tasks/{task_id}/decision', json={'action': 'approve'}).status_code == 200
+    assert client.post(f'/api/tasks/{task_id}/jobs/code').status_code == 202
+    monkeypatch.setattr(worker.code_changes, 'publish', lambda *args: url)
+    assert worker.process_one()
+
+    def sync(cwd, repo, pr_url):
+        assert pr_url == url
+        return {'state': 'OPEN', 'head': head, 'fork': False, 'checks': [{'state': 'SUCCESS'}]}
+
+    # Ignore the PR from the earlier test, which shares this temporary database.
+    with worker.db() as conn:
+        conn.execute('UPDATE pr_status SET synced_at=? WHERE task_id != ?', (worker.time.time(), task_id))
+    monkeypatch.setattr(worker.pr_review, 'review', sync)
+    worker.sync_one()
+    listed = next(item for item in client.get('/api/tasks').json() if item['id'] == task_id)
+    assert listed['pr']['snapshot']['checks'] == [{'state': 'SUCCESS'}]
+    endpoint = f'/api/tasks/{task_id}/revision'
+    assert client.post(endpoint, json={'head': 'b' * 40, 'note': 'Fix the check'}).status_code == 409
+    assert client.post(endpoint, json={'head': head, 'note': 'Fix the check'}).status_code == 202
+    assert client.post(endpoint, json={'head': head, 'note': 'Fix the check'}).status_code == 409
+
+    def revise(task, job_id, repo, revision, model_text):
+        assert revision == {'url': url, 'head': head, 'note': 'Fix the check'}
+        return url
+
+    monkeypatch.setattr(worker.code_changes, 'revise', revise)
+    assert worker.process_one()
+    listed = next(item for item in client.get('/api/tasks').json() if item['id'] == task_id)
+    assert listed['pr']['url'] == url
+    assert listed['pr']['snapshot'] is None
+
+
+def test_github_snapshot_links_only_current_check_artifacts(monkeypatch):
+    from app import pr_review
+
+    prefix = 'https://github.com/example/workspace/actions/runs/42'
+    pr = {
+        'state': 'OPEN', 'isDraft': True, 'headRefOid': 'a' * 40,
+        'headRefName': 'branch', 'isCrossRepository': False, 'reviewDecision': 'CHANGES_REQUESTED',
+        'reviewRequests': [{'login': 'reviewer'}],
+        'reviews': [{'author': {'login': 'reviewer'}, 'state': 'CHANGES_REQUESTED', 'body': 'Fix CI'}],
+        'statusCheckRollup': [
+            {'name': 'capture', 'conclusion': 'SUCCESS', 'detailsUrl': f'{prefix}/job/9'},
+            {'name': 'other', 'status': 'QUEUED', 'detailsUrl': 'https://example.org/runs/88'},
+        ],
+    }
+
+    def github(cwd, *args):
+        if args[0] == 'pr':
+            return pr
+        assert args == ('api', 'repos/example/workspace/actions/runs/42/artifacts?per_page=100')
+        return {'artifacts': [
+            {'id': 9, 'name': 'review-evidence', 'expired': False},
+            {'id': 10, 'name': 'review-evidence', 'expired': True},
+        ]}
+
+    monkeypatch.setattr(pr_review, 'gh_json', github)
+    result = pr_review.review(None, 'example/workspace', 'https://github.com/example/workspace/pull/12')
+    assert result['decision'] == 'CHANGES_REQUESTED'
+    assert result['requests'] == ['reviewer']
+    assert result['reviews'][0]['body'] == 'Fix CI'
+    assert result['checks'][1]['state'] == 'QUEUED'
+    assert result['evidence'] == [{'name': 'review-evidence', 'url': f'{prefix}/artifacts/9'}]

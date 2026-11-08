@@ -10,15 +10,38 @@ let items=[];
 let focusedReview;
 let healthState = {};
 let snapshot = '';
+function prControls(task){
+  const pr = task.pr;
+  if (!pr || !/^https:\/\/github\.com\//.test(pr.url)) return '';
+  const status = pr.snapshot;
+  const link = `<a href="${esc(pr.url)}" target="_blank" rel="noopener noreferrer">Open pull request</a>`;
+  if (pr.error || !status) return `<p>${link} · ${esc(pr.error || 'Waiting for GitHub status')}</p>`;
+  const checklist = status.checks.map(check => `<li>${esc(check.name)} · ${esc(check.state)}</li>`).join('');
+  const reviewers = status.requests.filter(Boolean).join(', ');
+  const reviews = status.reviews.map(review =>
+    `<li><strong>${esc(review.author || 'Reviewer')} · ${esc(review.state)}</strong>
+    <div class="details">${esc(review.body)}</div></li>`).join('');
+  const evidence = status.evidence.filter(item => /^https:\/\/github\.com\//.test(item.url)).map(item =>
+    `<li><a href="${esc(item.url)}" target="_blank" rel="noopener noreferrer">Screenshot and video</a></li>`).join('');
+  const canRevise = healthState.code_jobs && status.state === 'OPEN' && !status.fork &&
+    !['queued','running'].includes(task.job?.state);
+  return `<details><summary>Pull request · ${esc(status.state === 'OPEN' && status.draft ? 'Draft' : status.state)} · ${esc(status.decision || 'Review pending')}</summary>
+    <p>${link}</p>${reviewers ? `<p>Requested reviewers · ${esc(reviewers)}</p>` : ''}
+    ${checklist ? `<ul aria-label="CI checks">${checklist}</ul>` : '<p>No CI checks reported yet.</p>'}
+    ${reviews ? `<ul aria-label="Reviews">${reviews}</ul>` : ''}
+    ${evidence ? `<ul aria-label="CI evidence">${evidence}</ul>` : ''}
+    ${status.evidence_error ? '<p>Some evidence could not be loaded. Check Actions permissions.</p>' : ''}
+    ${canRevise ? `<label for="revision-${task.id}">Revision instructions</label>
+      <textarea id="revision-${task.id}" class="note" maxlength="3000"></textarea>
+      <button data-revision="${task.id}">Generate revision in this PR</button>` : ''}</details>`;
+}
 function jobControls(task){
   const job = task.job;
   if (job && ['queued','running'].includes(job.state)) {
     return `<p role="status">${esc(job.kind)} · ${esc(job.state)}</p>`;
   }
   const error = job?.state === 'failed' ? `<p class="error">${esc(job.error)}</p>` : '';
-  if (job?.kind === 'code' && job.state === 'done' && /^https:\/\/github\.com\//.test(job.result)) {
-    return `<p><a href="${esc(job.result)}" target="_blank" rel="noopener noreferrer">Open Draft PR and review CI evidence</a></p>`;
-  }
+  if (task.pr) return error;
   if (['new','rejected'].includes(task.status)) {
     return error + `<div class="task-actions"><button data-run="${task.id}">Generate proposal</button></div>`;
   }
@@ -43,9 +66,16 @@ function moveReview(direction){
   document.getElementById('task-'+focusedReview)?.focus();
 }
 async function refresh(polling=false){try{const [data,health]=await Promise.all([api('/api/tasks'),api('/api/health')]);const nextSnapshot=JSON.stringify([data,health]);
-if(polling && (nextSnapshot===snapshot || document.activeElement?.matches('.note, #tasks button')))return;
-snapshot=nextSnapshot;items=data;healthState=health;document.getElementById('mode').textContent=health.mode==='demo'?'Demo mode — no LLM':'LLM connected';document.getElementById('reviewCount').textContent=data.filter(x=>x.status==='pending_review').length;document.getElementById('openCount').textContent=data.filter(x=>['new','rejected','pending_review'].includes(x.status)).length;document.getElementById('approvedCount').textContent=data.filter(x=>x.status==='approved').length;document.getElementById('tasks').innerHTML=data.length?data.map(t=>`<article class="task" id="task-${t.id}" tabindex="-1"><div class="task-head"><span class="task-title">${esc(t.title)}</span><span class="tag ${esc(t.status)}">${esc(t.status.replaceAll('_',' '))}</span></div><small>${esc(t.domain)} · P${t.priority} · #${t.id}</small><p>${esc(t.description)}</p>${evidenceLinks(t.evidence)}${t.chief_summary?`<details open><summary>Chief of Staff recommendation</summary><div class="details">${esc(t.chief_summary)}</div></details><details><summary>Lead proposal and specialist work</summary><div class="details">${esc(t.proposal)}\n\nSPECIALIST\n${esc(t.specialist_output)}</div></details>`:''}${jobControls(t)}${t.status==='pending_review'?`<div class="task-actions"><button data-decision="approve" data-id="${t.id}">Approve</button><button class="secondary" data-decision="reject" data-id="${t.id}">Reject</button></div><textarea class="note" id="note-${t.id}" placeholder="Optional decision rationale (reused as agent memory)"></textarea>`:''}</article>`).join(''):'<div class="empty">No tasks yet. Create one to start.</div>';document.getElementById('error').textContent=''}catch(e){fail(e)}}
+if(polling && (nextSnapshot===snapshot || document.activeElement?.closest('#tasks')))return;
+snapshot=nextSnapshot;items=data;healthState=health;document.getElementById('mode').textContent=health.mode==='demo'?'Demo mode — no LLM':'LLM connected';document.getElementById('reviewCount').textContent=data.filter(x=>x.status==='pending_review').length;document.getElementById('openCount').textContent=data.filter(x=>['new','rejected','pending_review'].includes(x.status)).length;document.getElementById('approvedCount').textContent=data.filter(x=>x.status==='approved').length;document.getElementById('tasks').innerHTML=data.length?data.map(t=>`<article class="task" id="task-${t.id}" tabindex="-1"><div class="task-head"><span class="task-title">${esc(t.title)}</span><span class="tag ${esc(t.status)}">${esc(t.status.replaceAll('_',' '))}</span></div><small>${esc(t.domain)} · P${t.priority} · #${t.id}</small><p>${esc(t.description)}</p>${evidenceLinks(t.evidence)}${t.chief_summary?`<details open><summary>Chief of Staff recommendation</summary><div class="details">${esc(t.chief_summary)}</div></details><details><summary>Lead proposal and specialist work</summary><div class="details">${esc(t.proposal)}\n\nSPECIALIST\n${esc(t.specialist_output)}</div></details>`:''}${jobControls(t)}${prControls(t)}${t.status==='pending_review'?`<div class="task-actions"><button data-decision="approve" data-id="${t.id}">Approve</button><button class="secondary" data-decision="reject" data-id="${t.id}">Reject</button></div><textarea class="note" id="note-${t.id}" placeholder="Optional decision rationale (reused as agent memory)"></textarea>`:''}</article>`).join(''):'<div class="empty">No tasks yet. Create one to start.</div>';document.getElementById('error').textContent=''}catch(e){fail(e)}}
 document.getElementById('create').addEventListener('submit',async e=>{e.preventDefault();try{await api('/api/tasks',{method:'POST',body:JSON.stringify({title:document.getElementById('title').value,description:document.getElementById('desc').value,domain:document.getElementById('domain').value,priority:Number(document.getElementById('priority').value),evidence:['screenshot','video'].map(kind=>({kind,url:document.getElementById(kind).value.trim()})).filter(item=>item.url)})});e.target.reset();await refresh()}catch(x){fail(x)}});
-document.getElementById('tasks').addEventListener('click',async e=>{const btn=e.target.closest('button');if(!btn)return;btn.disabled=true;try{if(btn.dataset.run)await api(`/api/tasks/${btn.dataset.run}/${healthState.background_jobs?'jobs/proposal':'run'}`,{method:'POST'});else if(btn.dataset.code)await api(`/api/tasks/${btn.dataset.code}/jobs/code`,{method:'POST'});else if(btn.dataset.decision)await api(`/api/tasks/${btn.dataset.id}/decision`,{method:'POST',body:JSON.stringify({action:btn.dataset.decision,review_version:items.find(item=>item.id===Number(btn.dataset.id))?.updated_at,note:document.getElementById('note-'+btn.dataset.id)?.value||''})});await refresh()}catch(x){btn.disabled=false;fail(x)}});
+document.getElementById('tasks').addEventListener('click',async e=>{const btn=e.target.closest('button');if(!btn)return;btn.disabled=true;try{if(btn.dataset.run)await api(`/api/tasks/${btn.dataset.run}/${healthState.background_jobs?'jobs/proposal':'run'}`,{method:'POST'});else if(btn.dataset.code)await api(`/api/tasks/${btn.dataset.code}/jobs/code`,{method:'POST'});else if(btn.dataset.revision){
+  const id=Number(btn.dataset.revision);
+  const note=document.getElementById('revision-'+id).value.trim();
+  if(note.length<3)throw Error('Enter at least three characters of revision instructions.');
+  await api(`/api/tasks/${id}/revision`,{method:'POST',body:JSON.stringify({
+    head:items.find(item=>item.id===id)?.pr?.snapshot?.head,note,
+  })});
+}else if(btn.dataset.decision)await api(`/api/tasks/${btn.dataset.id}/decision`,{method:'POST',body:JSON.stringify({action:btn.dataset.decision,review_version:items.find(item=>item.id===Number(btn.dataset.id))?.updated_at,note:document.getElementById('note-'+btn.dataset.id)?.value||''})});await refresh()}catch(x){btn.disabled=false;fail(x)}});
 document.addEventListener('keydown',e=>{if(['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName)||e.ctrlKey||e.metaKey||e.altKey)return;if(e.key.toLowerCase()==='j')moveReview(1);if(e.key.toLowerCase()==='k')moveReview(-1);if(e.key.toLowerCase()==='r')refresh();if(e.key.toLowerCase()==='n')document.getElementById('title').focus()});refresh();setInterval(()=>{if(healthState.background_jobs)refresh(true)},2500);
 </script></body></html>
