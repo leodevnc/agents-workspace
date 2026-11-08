@@ -1,0 +1,35 @@
+name: Review evidence
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt 'playwright>=1.50,<2'
+      - run: python -m playwright install --with-deps chromium
+      - name: Record the review flow
+        run: |
+          export CHIEF_DB_PATH="$RUNNER_TEMP/review.sqlite3"
+          python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          for attempt in {1..30}; do
+            if curl -fsS http://127.0.0.1:8000/api/health >/dev/null; then break; fi
+            sleep 1
+          done
+          python scripts/capture_review.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: review-evidence
+          path: review-evidence/
+          if-no-files-found: ignore

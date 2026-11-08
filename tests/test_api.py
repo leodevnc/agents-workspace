@@ -73,3 +73,62 @@ def test_reject_non_web_evidence_url():
 def test_cross_origin_write_is_blocked():
     response = client.post('/api/tasks/1/run', headers={'Origin': 'https://example.com'})
     assert response.status_code == 403
+
+
+def test_background_job_priority_approval_and_retry(monkeypatch):
+    from app import worker
+
+    monkeypatch.setenv('CHIEF_BACKGROUND_JOBS', '1')
+    monkeypatch.setenv('CHIEF_GITHUB_REPO', 'example/workspace')
+
+    def create(priority):
+        return client.post('/api/tasks', json={
+            'title': 'Review an engineering change',
+            'description': 'Implement a small change',
+            'priority': priority,
+        }).json()['id']
+
+    low = create(3)
+    high = create(1)
+    endpoint = f'/api/tasks/{high}/jobs/code'
+    assert client.post(endpoint).status_code == 409
+    assert client.post(f'/api/tasks/{high}/run').status_code == 409
+    assert worker.process_one()
+    listed = {task['id']: task for task in client.get('/api/tasks').json()}
+    assert listed[high]['status'] == 'pending_review'
+    assert listed[low]['job']['state'] == 'queued'
+    assert client.post(f'/api/tasks/{high}/decision', json={'action': 'approve'}).status_code == 200
+    job_id = client.post(endpoint).json()['id']
+    assert client.post(endpoint).json()['id'] == job_id
+
+    calls = []
+
+    def publish(task, queued_id, target_repo, model_text):
+        assert task['id'] == high
+        assert target_repo == 'example/workspace'
+        calls.append(queued_id)
+        if len(calls) == 1:
+            raise worker.code_changes.CodeJobError('Temporary test error')
+        return 'https://github.com/example/workspace/pull/1'
+
+    monkeypatch.setattr(worker.code_changes, 'publish', publish)
+    assert worker.process_one()
+    assert client.post(endpoint).json()['id'] == job_id
+    assert worker.process_one()
+    listed = {task['id']: task for task in client.get('/api/tasks').json()}
+    assert listed[high]['job']['state'] == 'done'
+    assert listed[high]['job']['result'].endswith('/pull/1')
+    assert calls == [job_id, job_id]
+    assert worker.process_one()
+
+
+def test_code_edits_cannot_escape_configured_files():
+    import pytest
+    from app.code_changes import CodeJobError, parse_edits
+
+    sources = {'app/main.py': ('100644', 'old')}
+    assert parse_edits('{"app/main.py":"new"}', sources) == {'app/main.py': 'new'}
+    with pytest.raises(CodeJobError):
+        parse_edits('{"app/main.py":"new",".github/workflows/ci.yml":"modified"}', sources)
+    with pytest.raises(CodeJobError):
+        parse_edits('{"app/main.py":"old"}', sources)
